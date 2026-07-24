@@ -244,6 +244,18 @@ function buildMainRow(list) {
   return new ActionRowBuilder().addComponents(joinBtn, leaveBtn, manageBtn, threadBtn, toggleBtn);
 }
 
+// Отдельный ряд с кнопкой назначения администратора — виден всем под основным сообщением,
+// но нажать её результативно может только создатель набора (проверка внутри обработчика).
+function buildAdminRow(list) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(cid('wine', 'addadmin', list.id))
+      .setLabel('Добавить администратора')
+      .setEmoji('🎖️')
+      .setStyle(ButtonStyle.Primary)
+  );
+}
+
 function buildPositionsEmbed(list) {
   const taken = list.positions.filter(Boolean).length;
   const lines = list.positions.map((uid, i) => {
@@ -267,6 +279,11 @@ function buildPositionsRow(list) {
       .setEmoji('🙋')
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
+      .setCustomId(cid('wine', 'leaveposition', list.id))
+      .setLabel('Покинуть позицию')
+      .setEmoji('🚪')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
       .setCustomId(cid('wine', 'posmanage', list.id))
       .setLabel('Управление позициями')
       .setEmoji('🎖️')
@@ -278,7 +295,7 @@ async function updateListMessage(guild, list) {
   try {
     const channel = await guild.channels.fetch(list.channelId);
     const message = await channel.messages.fetch(list.messageId);
-    await message.edit({ embeds: [buildEmbed(list)], components: [buildMainRow(list)] });
+    await message.edit({ embeds: [buildEmbed(list)], components: [buildMainRow(list), buildAdminRow(list)] });
   } catch (e) {
     console.error('Не удалось обновить сообщение набора:', e);
   }
@@ -316,15 +333,15 @@ function chunkMentions(userIds, prefix) {
 
   for (const id of userIds) {
     const mention = `<@${id}> `;
-    
-    // Разбиваем, если превышаем лимит символов (1900) 
+
+    // Разбиваем, если превышаем лимит символов (1900)
     // ИЛИ лимит упоминаний в одном сообщении (90, лимит Discord - 100)
     if ((currentString + mention).length > 1900 || currentUserIds.length >= 90) {
       chunks.push({ content: currentString.trim(), users: currentUserIds });
       currentString = '';
       currentUserIds = [];
     }
-    
+
     currentString += mention;
     currentUserIds.push(id);
   }
@@ -1116,7 +1133,11 @@ async function handleWineCommand(interaction) {
 
   const embed = buildEmbed(list);
   const row = buildMainRow(list);
-  const sent = await interaction.editReply({ embeds: [embed], components: [row], fetchReply: true });
+  const sent = await interaction.editReply({
+    embeds: [embed],
+    components: [row, buildAdminRow(list)],
+    fetchReply: true,
+  });
   list.messageId = sent.id;
   saveLists(lists);
 
@@ -1139,17 +1160,17 @@ async function handleWineCommand(interaction) {
       `📡 Оповещение по роли **${role.name}** — набор «${title}»:\n`
     );
     const channel = interaction.channel;
-    
+
     // Модифицированный цикл с поддержкой объектов-чанков
     for (const chunk of chunks) {
-      if (!chunk.content) continue; 
+      if (!chunk.content) continue;
 
       const msg = await channel.send({
         content: chunk.content,
         // Передаем только те ID, которые физически находятся в этом сообщении
-        allowedMentions: { users: chunk.users }, 
+        allowedMentions: { users: chunk.users },
       });
-      
+
       setTimeout(() => msg.delete().catch(() => {}), 5000);
     }
   } catch (e) {
@@ -1221,12 +1242,12 @@ async function handleButton(interaction) {
     if (isFull(list)) {
       list.reserve.push(uid);
       saveLists(lists);
-      await interaction.update({ embeds: [buildEmbed(list)], components: [buildMainRow(list)] });
+      await interaction.update({ embeds: [buildEmbed(list)], components: [buildMainRow(list), buildAdminRow(list)] });
       return;
     }
     list.participants.push(uid);
     saveLists(lists);
-    await interaction.update({ embeds: [buildEmbed(list)], components: [buildMainRow(list)] });
+    await interaction.update({ embeds: [buildEmbed(list)], components: [buildMainRow(list), buildAdminRow(list)] });
     await syncThreadMembers(guild, list, uid, null);
     return;
   }
@@ -1236,7 +1257,7 @@ async function handleButton(interaction) {
       list.participants = list.participants.filter((id) => id !== uid);
       const posChanged = freeUserPosition(list, uid);
       saveLists(lists);
-      await interaction.update({ embeds: [buildEmbed(list)], components: [buildMainRow(list)] });
+      await interaction.update({ embeds: [buildEmbed(list)], components: [buildMainRow(list), buildAdminRow(list)] });
       await syncThreadMembers(guild, list, null, uid);
       if (posChanged) await updatePositionsMessage(guild, list);
       return;
@@ -1244,7 +1265,7 @@ async function handleButton(interaction) {
     if (list.reserve.includes(uid)) {
       list.reserve = list.reserve.filter((id) => id !== uid);
       saveLists(lists);
-      await interaction.update({ embeds: [buildEmbed(list)], components: [buildMainRow(list)] });
+      await interaction.update({ embeds: [buildEmbed(list)], components: [buildMainRow(list), buildAdminRow(list)] });
       return;
     }
     await interaction.reply({ content: 'Вы не записаны ни в основной состав, ни в резерв.', ephemeral: true });
@@ -1258,7 +1279,7 @@ async function handleButton(interaction) {
     }
     list.isOpen = !list.isOpen;
     saveLists(lists);
-    await interaction.update({ embeds: [buildEmbed(list)], components: [buildMainRow(list)] });
+    await interaction.update({ embeds: [buildEmbed(list)], components: [buildMainRow(list), buildAdminRow(list)] });
     return;
   }
 
@@ -1270,18 +1291,7 @@ async function handleButton(interaction) {
       });
       return;
     }
-    const isCreator = list.creatorId === uid;
-    const row1Buttons = [];
-    if (isCreator) {
-      row1Buttons.push(
-        new ButtonBuilder()
-          .setCustomId(cid('wine', 'addadmin', listId))
-          .setLabel('Добавить администратора')
-          .setEmoji('🎖️')
-          .setStyle(ButtonStyle.Primary)
-      );
-    }
-    row1Buttons.push(
+    const row1Buttons = [
       new ButtonBuilder()
         .setCustomId(cid('wine', 'addperson', listId))
         .setLabel('Добавить участников')
@@ -1291,12 +1301,13 @@ async function handleButton(interaction) {
         .setCustomId(cid('wine', 'removeperson', listId))
         .setLabel('Удалить участников')
         .setEmoji('🗑️')
-        .setStyle(ButtonStyle.Danger)
-    );
+        .setStyle(ButtonStyle.Danger),
+    ];
     await interaction.reply({
       content:
         '🛠️ Панель управления набором:\n' +
-        '_«Добавить участников» переносит и людей из резерва — их оттуда уберёт автоматически._',
+        '_«Добавить участников» переносит и людей из резерва — их оттуда уберёт автоматически._\n' +
+        '_Назначить администратора можно кнопкой «Добавить администратора» под основным сообщением набора._',
       components: [new ActionRowBuilder().addComponents(row1Buttons)],
       ephemeral: true,
     });
@@ -1392,6 +1403,24 @@ async function handleButton(interaction) {
       .setMaxLength(5);
     modal.addComponents(new ActionRowBuilder().addComponents(posInput));
     await interaction.showModal(modal);
+    return;
+  }
+
+  if (action === 'leaveposition') {
+    if (!list.positionsCount) {
+      await interaction.reply({ content: '⚠️ В этом наборе нет списка позиций.', ephemeral: true });
+      return;
+    }
+    const idx = list.positions.findIndex((p) => p === uid);
+    if (idx === -1) {
+      await interaction.reply({ content: 'Вы не занимаете ни одной позиции.', ephemeral: true });
+      return;
+    }
+    list.positions[idx] = null;
+    saveLists(lists);
+    await interaction.deferUpdate();
+    await updatePositionsMessage(guild, list);
+    await interaction.followUp({ content: `✅ Вы покинули позицию №${idx + 1}.`, ephemeral: true });
     return;
   }
 
