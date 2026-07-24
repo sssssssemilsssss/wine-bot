@@ -308,19 +308,33 @@ function freeUserPosition(list, userId) {
   return changed;
 }
 
+// Новая исправленная функция для разбивки упоминаний с лимитами символов и количества юзеров
 function chunkMentions(userIds, prefix) {
   const chunks = [];
-  let current = prefix;
+  let currentString = prefix;
+  let currentUserIds = [];
+
   for (const id of userIds) {
     const mention = `<@${id}> `;
-    if ((current + mention).length > 1900) {
-      chunks.push(current.trim());
-      current = '';
+    
+    // Разбиваем, если превышаем лимит символов (1900) 
+    // ИЛИ лимит упоминаний в одном сообщении (90, лимит Discord - 100)
+    if ((currentString + mention).length > 1900 || currentUserIds.length >= 90) {
+      chunks.push({ content: currentString.trim(), users: currentUserIds });
+      currentString = '';
+      currentUserIds = [];
     }
-    current += mention;
+    
+    currentString += mention;
+    currentUserIds.push(id);
   }
-  if (current.trim().length) chunks.push(current.trim());
-  return chunks.length ? chunks : [prefix.trim()];
+
+  // Добавляем остаток, если он есть
+  if (currentString.trim().length) {
+    chunks.push({ content: currentString.trim(), users: currentUserIds });
+  }
+
+  return chunks.length ? chunks : [{ content: prefix.trim(), users: [] }];
 }
 
 async function syncThreadMembers(guild, list, addedId, removedId) {
@@ -1054,6 +1068,7 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
+// Обновленная функция отправки оповещения, использующая новую chunkMentions
 async function handleWineCommand(interaction) {
   const title = interaction.options.getString('название');
   const quantityRaw = interaction.options.getString('количество').trim();
@@ -1124,11 +1139,17 @@ async function handleWineCommand(interaction) {
       `📡 Оповещение по роли **${role.name}** — набор «${title}»:\n`
     );
     const channel = interaction.channel;
+    
+    // Модифицированный цикл с поддержкой объектов-чанков
     for (const chunk of chunks) {
+      if (!chunk.content) continue; 
+
       const msg = await channel.send({
-        content: chunk,
-        allowedMentions: { users: membersWithRole },
+        content: chunk.content,
+        // Передаем только те ID, которые физически находятся в этом сообщении
+        allowedMentions: { users: chunk.users }, 
       });
+      
       setTimeout(() => msg.delete().catch(() => {}), 5000);
     }
   } catch (e) {
