@@ -54,7 +54,7 @@ const wineCommand = new SlashCommandBuilder()
   .addStringOption((opt) =>
     opt
       .setName('количество')
-      .setDescription('Число участников или слово "Неограничено"')
+      .setDescription('Число участников, слово "Неограничено" или "-" для безлимита')
       .setRequired(true)
   )
   .addStringOption((opt) =>
@@ -1093,13 +1093,13 @@ async function handleWineCommand(interaction) {
   const role = interaction.options.getRole('роль');
 
   let quantity;
-  if (/^неограничено$/i.test(quantityRaw) || quantityRaw === '∞') {
+  if (/^неограничено$/i.test(quantityRaw) || quantityRaw === '∞' || quantityRaw === '-') {
     quantity = 'Неограничено';
   } else if (/^\d+$/.test(quantityRaw)) {
     quantity = quantityRaw;
   } else {
     await interaction.reply({
-      content: '⚠️ Количество должно быть числом или словом «Неограничено».',
+      content: '⚠️ Количество должно быть числом, словом «Неограничено» или «-».',
       ephemeral: true,
     });
     return;
