@@ -1114,9 +1114,14 @@ async function handleWineCommand(interaction) {
 
   try {
     await guild.members.fetch({ force: true });
+    const targetChannel = interaction.channel;
     const membersWithRole = role.members
-      .map((m) => m.id)
-      .filter((id) => id !== client.user.id);
+      .filter((m) => m.id !== client.user.id)
+      .filter((m) => {
+        const perms = targetChannel.permissionsFor(m);
+        return perms ? perms.has(PermissionFlagsBits.ViewChannel) : false;
+      })
+      .map((m) => m.id);
 
     if (!membersWithRole.length) {
       await interaction.followUp({
@@ -1332,10 +1337,6 @@ async function handleButton(interaction) {
   }
 
   if (action === 'thread') {
-    if (!isManager(list, uid)) {
-      await interaction.reply({ content: '⛔ Нет доступа.', ephemeral: true });
-      return;
-    }
     if (list.threadId) {
       await interaction.reply({ content: `ℹ️ Ветка уже создана: <#${list.threadId}>`, ephemeral: true });
       return;
@@ -1556,11 +1557,6 @@ async function handleModalSubmit(interaction) {
   }
 
   if (action === 'threadmodal') {
-    if (!isManager(list, interaction.user.id)) {
-      await interaction.reply({ content: '⛔ Нет доступа.', ephemeral: true });
-      return;
-    }
-
     const threadName = interaction.fields.getTextInputValue('threadname');
     const positionsRaw = interaction.fields.getTextInputValue('positions').trim();
 
