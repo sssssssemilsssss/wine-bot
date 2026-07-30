@@ -299,6 +299,11 @@ function buildPositionsRow(list) {
       .setCustomId(cid('wine', 'posmanage', list.id))
       .setLabel('Управление позициями')
       .setEmoji('🎖️')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(cid('wine', 'pingunassigned', list.id))
+      .setLabel('Тегнуть незанявших')
+      .setEmoji('📣')
       .setStyle(ButtonStyle.Secondary)
   );
 }
@@ -350,6 +355,24 @@ function chunkMentions(userIds, prefix) {
   }
   if (current.trim().length) chunks.push(current.trim());
   return chunks.length ? chunks : [prefix.trim()];
+}
+
+function getUnassignedParticipants(list) {
+  if (!list.positionsCount) return [];
+  const assigned = new Set((list.positions || []).filter(Boolean));
+  return (list.participants || []).filter((id) => !assigned.has(id));
+}
+
+async function pingUnassignedParticipants(channel, list) {
+  const unassigned = getUnassignedParticipants(list);
+  if (!unassigned.length) {
+    return { sent: false, reason: 'none' };
+  }
+  const chunks = chunkMentions(unassigned, '⚠️ Ещё не заняли позицию: ');
+  for (const chunk of chunks) {
+    await channel.send({ content: chunk });
+  }
+  return { sent: true, count: unassigned.length };
 }
 
 async function syncThreadMembers(guild, list, addedId, removedId) {
@@ -1508,6 +1531,30 @@ async function handleButton(interaction) {
     return;
   }
 
+  if (action === 'pingunassigned') {
+    if (!list.positionsCount) {
+      await interaction.reply({ content: '⚠️ В этом наборе нет списка позиций.', ephemeral: true });
+      return;
+    }
+    if (!list.threadId) {
+      await interaction.reply({ content: '⚠️ У этого набора нет ветки.', ephemeral: true });
+      return;
+    }
+    await interaction.deferReply({ ephemeral: true });
+    const thread = await interaction.guild.channels.fetch(list.threadId).catch(() => null);
+    if (!thread) {
+      await interaction.editReply({ content: '⚠️ Не удалось найти ветку.' });
+      return;
+    }
+    const result = await pingUnassignedParticipants(thread, list);
+    if (!result.sent) {
+      await interaction.editReply({ content: '✅ Все участники уже заняли позиции.' });
+    } else {
+      await interaction.editReply({ content: `📣 Отмечено участников без позиции: ${result.count}.` });
+    }
+    return;
+  }
+
   if (action === 'posmanage') {
     if (!isManager(list, uid)) {
       await interaction.reply({ content: '⛔ Нет доступа.', ephemeral: true });
@@ -1728,6 +1775,8 @@ async function handleModalSubmit(interaction) {
           components: [buildPositionsRow(list)],
         });
         list.positionsMessageId = posMsg.id;
+        saveLists(lists);
+        await pingUnassignedParticipants(thread, list);
       }
 
       saveLists(lists);
