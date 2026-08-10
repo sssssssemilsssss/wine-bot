@@ -435,9 +435,11 @@ function chunkMentions(userIds, prefix) {
 //  3. Бот создаёт ветку (тред) от этого сообщения и тегает туда всех, кто был упомянут в списке.
 //  4. Первое сообщение в ветке — эмбед со статусом (кто залил / кто нет).
 //  5. Внутри ветки создатель может править состав: "+ @юзер" (добавить) / "- @юзер" (убрать).
-//  6. Отчёт — сообщение со ссылкой, начинающейся с "https://". Как только он пришёл — участник
-//     отмечается залившим, эмбед обновляется.
-//  7. Если ссылка неправильная (не https, либо кинули файл/скрин вместо ссылки) — бот тегает
+//  6. Отчёт — сообщение со ссылкой (https://, http://, www. или просто "домен.com/путь" —
+//     любой вариант годится). Как только он пришёл — участник отмечается залившим, эмбед
+//     обновляется. Если участник заливает ссылку повторно (например, залил не тот откат),
+//     она просто заменяет старую.
+//  7. Если ссылки нет (кинули файл/скрин, либо просто упомянули домен без пути) — бот тегает
 //     автора и пишет, что отчёт не засчитан.
 //  8. Каждый час бот тегает в ветке тех, кто ещё не залил.
 //  9. Когда залили все — ветка НЕ закрывается, бот только тегает FINAL_PING_USER_IDS.
@@ -518,7 +520,7 @@ function buildBranchEmbed(branch) {
     )
     .setColor(allDone && total > 0 ? 0x57f287 : submittedCount > 0 ? 0xf1c40f : 0xed4245)
     .addFields(fields)
-    .setFooter({ text: `ID ветки: ${branch.id} · отчёт = сообщение со ссылкой, начинающейся с https://` })
+    .setFooter({ text: `ID ветки: ${branch.id} · отчёт = сообщение со ссылкой (https://, www. или просто домен.com/путь)` })
     .setTimestamp();
 }
 
@@ -550,7 +552,7 @@ async function sendBranchReminder(client, branch) {
 
     const chunks = chunkMentions(
       unsubmitted.map((p) => p.id),
-      '⏰ Ждём отчёт (ссылку, начинающуюся с https://) от:\n'
+      '⏰ Ждём отчёт (ссылку на видео/запись) от:\n'
     );
     for (const chunk of chunks) {
       await thread.send({ content: chunk }).catch(() => {});
@@ -658,7 +660,7 @@ async function tryCreateBranch(message) {
 
   const tagChunks = chunkMentions(
     mentionedUsers.map((u) => u.id),
-    '🎥 Ветка отчётов создана. Как заливёте отчёт — киньте сюда ссылку, начинающуюся с https://\n'
+    '🎥 Ветка отчётов создана. Как заливёте отчёт — киньте сюда ссылку (подойдёт с https://, www. или просто "домен.com/путь")\n'
   );
   for (const chunk of tagChunks) {
     await thread.send({ content: chunk }).catch(() => {});
@@ -729,12 +731,13 @@ async function tryManageBranchParticipants(message, branch) {
 }
 
 // Похоже, что человек пытался залить отчёт (кинул ссылку не того вида или файл/скрин
-// напрямую), но валидной https-ссылки в сообщении нет.
+// напрямую), но валидной ссылки на отчёт в сообщении нет.
 function looksLikeInvalidReportAttempt(message) {
-  if (message.content.match(/https:\/\/\S+/)) return false; // это уже валидный отчёт
-  const hasBadLink = /(^|\s)(http:\/\/|www\.)\S+/i.test(message.content);
+  if (extractReportLink(message.content)) return false; // это уже валидный отчёт
+  // Домен упомянут (например просто "youtube.com" без пути) — похоже на недописанную ссылку.
+  const looksLikeBareDomain = /\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b/i.test(message.content);
   const hasMedia = message.attachments.size > 0; // видео/фото/файл вложением, без ссылки
-  return hasBadLink || hasMedia;
+  return looksLikeBareDomain || hasMedia;
 }
 
 // Вложение с видео (файлом, не ссылкой) — такие бот удаляет из ветки, отчёт принимается
@@ -746,24 +749,40 @@ function hasVideoAttachment(message) {
   });
 }
 
-// Ссылка, начинающаяся с https:// внутри ветки — засчитываем как залитый отчёт.
-// Если участник явно пытался залить отчёт, но ссылка неправильная (не https, либо
-// прислал файл/скрин вместо ссылки) — бот тегает его и пишет, что не засчитано.
+// Достаём ссылку на отчёт из текста сообщения. Игроки присылают её по-разному —
+// с https://, с http://, с www., а часто и вовсе без протокола (просто
+// "youtube.com/watch?v=..."), поэтому строгая проверка только на "https://" пропускала
+// половину нормальных отчётов. Порядок: сперва ищем полноценную ссылку (http(s):// или
+// www.), и только если её нет — «голый» домен, но обязательно с путём после него
+// (иначе слишком много ложных срабатываний на обычные фразы с точкой внутри).
+function extractReportLink(content) {
+  let match = content.match(/\b(?:https?:\/\/|www\.)[^\s)>\]]+/i);
+  if (!match) match = content.match(/\b(?:[a-z0-9-]+\.)+[a-z]{2,}\/[^\s)>\]]*/i);
+  if (!match) return null;
+
+  let url = match[0].replace(/[.,!?;:]+$/, ''); // случайную пунктуацию на конце убираем
+  if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
+  return url;
+}
+
+// Ссылка внутри ветки (в любом из принятых форматов) — засчитываем как залитый отчёт.
+// Если участник явно пытался залить отчёт, но ссылка неправильная, либо прислал
+// файл/скрин вместо ссылки — бот тегает его и пишет, что не засчитано.
 // Видеофайлы вложением бот в любом случае удаляет — отчёт принимается только ссылкой.
 async function tryRegisterBranchReport(message, branch) {
   const participant = branch.participants.find((p) => p.id === message.author.id);
   if (!participant) return false;
 
-  const match = message.content.match(/https:\/\/\S+/);
+  const link = extractReportLink(message.content);
   const videoAttached = hasVideoAttachment(message);
 
-  if (match) {
+  if (link) {
     // Если человек уже заливал отчёт раньше и кидает новую ссылку — считаем это
     // заменой (например, залил не тот откат). Просто перезаписываем, без запретов.
     const isReplace = participant.submitted;
 
     participant.submitted = true;
-    participant.link = match[0];
+    participant.link = link;
     participant.reportText = message.content.trim();
     participant.submittedAt = Math.floor(Date.now() / 1000);
     saveBranches(branches);
@@ -779,8 +798,12 @@ async function tryRegisterBranchReport(message, branch) {
         })
         .catch(() => {});
     } else if (isReplace) {
+      await message.suppressEmbeds(true).catch(() => {});
       await message.react('🔄').catch(() => {});
     } else {
+      // Убираем автоматический предпросмотр ссылки (превью YouTube и т.п.) под
+      // сообщением — с ним тред быстро зарастает картинками, а ✅ и так всё говорит.
+      await message.suppressEmbeds(true).catch(() => {});
       await message.react('✅').catch(() => {});
     }
 
@@ -795,7 +818,7 @@ async function tryRegisterBranchReport(message, branch) {
     await message.delete().catch(() => {});
     await message.channel
       .send({
-        content: `❌ <@${message.author.id}>, видеофайл вложением удалён и отчёт не засчитан — нужна ссылка, начинающаяся с \`https://\`.`,
+        content: `❌ <@${message.author.id}>, видеофайл вложением удалён и отчёт не засчитан — нужна ссылка на отчёт.`,
       })
       .catch(() => {});
     return true;
@@ -805,7 +828,7 @@ async function tryRegisterBranchReport(message, branch) {
     await message.react('❌').catch(() => {});
     await message
       .reply({
-        content: `❌ <@${message.author.id}>, отчёт не засчитан — нужна ссылка, начинающаяся с \`https://\`.`,
+        content: `❌ <@${message.author.id}>, отчёт не засчитан — нужна полная ссылка (например https://youtube.com/watch?v=... или youtube.com/watch?v=...).`,
       })
       .catch(() => {});
     return true;
