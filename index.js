@@ -462,39 +462,63 @@ function chunkTextLines(lines, limit = 1000) {
   return chunks;
 }
 
+// Визуальный прогресс-бар из квадратов-эмодзи, например 🟩🟩🟩⬜⬜⬜⬜ 3/7.
+function buildProgressBar(done, total, size = 10) {
+  if (total === 0) return '▫️ пусто';
+  const filled = Math.round((done / total) * size);
+  return '🟩'.repeat(filled) + '⬜'.repeat(size - filled);
+}
+
+// То, что участник написал вместе со ссылкой на отчёт (например "https://... EmilNick"),
+// показываем в эмбеде как есть — без превращения в скрытую гиперссылку [отчёт](...),
+// чтобы был виден и сам линк, и никнейм/подпись рядом с ним. Многострочные сообщения
+// схлопываем в одну строку и обрезаем, чтобы один участник не разъезжал весь список.
+function formatReportLine(text, limit = 300) {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  return clean.length > limit ? `${clean.slice(0, limit - 1)}…` : clean;
+}
+
 function buildBranchEmbed(branch) {
   const total = branch.participants.length;
   const submittedCount = branch.participants.filter((p) => p.submitted).length;
   const allDone = total > 0 && submittedCount === total;
+  const pct = total ? Math.round((submittedCount / total) * 100) : 0;
 
-  const lines = branch.participants.length
-    ? branch.participants.map((p) =>
-        p.submitted
-          ? `✅ <@${p.id}> — [отчёт](${p.link})`
-          : `❌ <@${p.id}> — не залито`
-      )
-    : ['_список пуст — добавь участников через "+ @юзер"_'];
+  const fields = [];
 
-  const fields = [
-    { name: '📌 Статус', value: allDone ? '✅ Все залили' : `🟡 В процессе`, inline: true },
-    { name: '📊 Залито', value: `${submittedCount} / ${total}`, inline: true },
-    { name: '⏳ Осталось', value: `${total - submittedCount}`, inline: true },
-    { name: '👑 Создал', value: `<@${branch.creatorId}>`, inline: true },
-    { name: '🕐 Создана', value: `<t:${branch.createdAt}:R>`, inline: true },
-  ];
-
-  chunkTextLines(lines).forEach((val, i) => {
-    fields.push({
-      name: i === 0 ? '📋 Участники' : '\u200b',
-      value: val,
-    });
+  fields.push({
+    name: '👑 Создал  ·  🕐 Создана',
+    value: `<@${branch.creatorId}>  ·  <t:${branch.createdAt}:R>`,
   });
 
+  if (!branch.participants.length) {
+    fields.push({ name: '📋 Участники', value: '_список пуст — добавь участников через "+ @юзер"_' });
+  } else {
+    const submittedLines = branch.participants
+      .filter((p) => p.submitted)
+      .map((p) => `<@${p.id}> — ${formatReportLine(p.reportText || p.link)}`);
+    const pendingLines = branch.participants
+      .filter((p) => !p.submitted)
+      .map((p) => `<@${p.id}>`);
+
+    chunkTextLines(submittedLines.length ? submittedLines : ['_пока никто не залил_']).forEach(
+      (val, i) => fields.push({ name: i === 0 ? `✅ Залито (${submittedCount}/${total})` : '\u200b', value: val })
+    );
+    chunkTextLines(pendingLines.length ? pendingLines : ['_все залили_']).forEach(
+      (val, i) => fields.push({ name: i === 0 ? `❌ Осталось (${total - submittedCount}/${total})` : '\u200b', value: val })
+    );
+  }
+
   return new EmbedBuilder()
-    .setTitle(`🎥 Ветка отчётов: ${branch.name}`)
-    .setColor(allDone ? 0x57f287 : 0xf1c40f)
+    .setTitle(`🎬 Ветка отчётов: ${branch.name}`)
+    .setDescription(
+      allDone && total > 0
+        ? `**✅ Все отчёты залиты!**\n${buildProgressBar(submittedCount, total)}  ${pct}%`
+        : `${buildProgressBar(submittedCount, total)}  **${submittedCount}/${total}** · ${pct}%`
+    )
+    .setColor(allDone && total > 0 ? 0x57f287 : submittedCount > 0 ? 0xf1c40f : 0xed4245)
     .addFields(fields)
-    .setFooter({ text: `ID ветки: ${branch.id} · отчёт = ссылка, начинающаяся с https://` })
+    .setFooter({ text: `ID ветки: ${branch.id} · отчёт = сообщение со ссылкой, начинающейся с https://` })
     .setTimestamp();
 }
 
@@ -619,7 +643,7 @@ async function tryCreateBranch(message) {
     name,
     creatorId: message.author.id,
     createdAt: Math.floor(Date.now() / 1000),
-    participants: mentionedUsers.map((u) => ({ id: u.id, submitted: false, link: null, submittedAt: null })),
+    participants: mentionedUsers.map((u) => ({ id: u.id, submitted: false, link: null, reportText: null, submittedAt: null })),
     statusMessageId: null,
     allSubmittedAnnounced: false,
   };
@@ -667,7 +691,7 @@ async function tryManageBranchParticipants(message, branch) {
   if (sign === '+') {
     for (const u of mentionedUsers) {
       if (!branch.participants.some((p) => p.id === u.id)) {
-        branch.participants.push({ id: u.id, submitted: false, link: null, submittedAt: null });
+        branch.participants.push({ id: u.id, submitted: false, link: null, reportText: null, submittedAt: null });
         changed = true;
       }
     }
@@ -734,8 +758,13 @@ async function tryRegisterBranchReport(message, branch) {
   const videoAttached = hasVideoAttachment(message);
 
   if (match) {
+    // Если человек уже заливал отчёт раньше и кидает новую ссылку — считаем это
+    // заменой (например, залил не тот откат). Просто перезаписываем, без запретов.
+    const isReplace = participant.submitted;
+
     participant.submitted = true;
     participant.link = match[0];
+    participant.reportText = message.content.trim();
     participant.submittedAt = Math.floor(Date.now() / 1000);
     saveBranches(branches);
 
@@ -744,9 +773,13 @@ async function tryRegisterBranchReport(message, branch) {
       await message.delete().catch(() => {});
       await message.channel
         .send({
-          content: `🗑️ <@${message.author.id}>, ссылка принята, видеофайл вложением удалён — заливай отчёт только ссылкой.`,
+          content: isReplace
+            ? `🔄 <@${message.author.id}>, отчёт заменён новой ссылкой, видеофайл вложением удалён — заливай отчёт только ссылкой.`
+            : `🗑️ <@${message.author.id}>, ссылка принята, видеофайл вложением удалён — заливай отчёт только ссылкой.`,
         })
         .catch(() => {});
+    } else if (isReplace) {
+      await message.react('🔄').catch(() => {});
     } else {
       await message.react('✅').catch(() => {});
     }
@@ -1615,34 +1648,7 @@ client.on('threadDelete', async (thread) => {
   }
 });
 
-// Discord даёт всего ~3 сек на первый ответ на interaction. Если бот в этот момент был
-// занят/перезапускался (например, при передеплое) — токен успевает "протухнуть", и ЛЮБАЯ
-// попытка ответить (reply/update/deferReply/...) падает с DiscordAPIError 10062 "Unknown
-// interaction". Само взаимодействие уже не спасти, но это не баг в логике команды — такие
-// ошибки просто гасим здесь одним местом, вместо падения с двойным стектрейсом в логах.
-const STALE_INTERACTION_CODES = new Set([10062, 40060, 10008]); // Unknown interaction / already acknowledged / unknown message
-
-function patchInteractionAckMethods(interaction) {
-  const methods = ['reply', 'update', 'deferReply', 'deferUpdate', 'followUp', 'editReply', 'showModal'];
-  for (const name of methods) {
-    if (typeof interaction[name] !== 'function') continue;
-    const original = interaction[name].bind(interaction);
-    interaction[name] = async (...args) => {
-      try {
-        return await original(...args);
-      } catch (err) {
-        if (err && STALE_INTERACTION_CODES.has(err.code)) {
-          console.warn(`⚠️ Взаимодействие устарело (код ${err.code}, ${name}) — пропускаю, ответ пользователю не дойдёт.`);
-          return null;
-        }
-        throw err;
-      }
-    };
-  }
-}
-
 client.on('interactionCreate', async (interaction) => {
-  patchInteractionAckMethods(interaction);
   try {
     if (interaction.isChatInputCommand() && interaction.commandName === 'wine') {
       await handleWineCommand(interaction);
@@ -1680,7 +1686,6 @@ client.on('interactionCreate', async (interaction) => {
     await notifyError(interaction, `Произошла ошибка: ${err.message || err}`);
   }
 });
-
 
 async function handleWineCommand(interaction) {
   const title = interaction.options.getString('название');
