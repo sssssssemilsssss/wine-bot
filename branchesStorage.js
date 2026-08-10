@@ -18,7 +18,11 @@ function loadBranches() {
 
 function saveBranches(branches) {
   const obj = Object.fromEntries(branches);
-  fs.writeFileSync(FILE, JSON.stringify(obj, null, 2), 'utf8');
+  // Пишем во временный файл и переименовываем — так при падении процесса
+  // посреди записи branches.json не остаётся битым (rename атомарен на диске).
+  const tmp = `${FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8');
+  fs.renameSync(tmp, FILE);
 }
 
 module.exports = { loadBranches, saveBranches };
