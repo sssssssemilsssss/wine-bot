@@ -1615,7 +1615,34 @@ client.on('threadDelete', async (thread) => {
   }
 });
 
+// Discord даёт всего ~3 сек на первый ответ на interaction. Если бот в этот момент был
+// занят/перезапускался (например, при передеплое) — токен успевает "протухнуть", и ЛЮБАЯ
+// попытка ответить (reply/update/deferReply/...) падает с DiscordAPIError 10062 "Unknown
+// interaction". Само взаимодействие уже не спасти, но это не баг в логике команды — такие
+// ошибки просто гасим здесь одним местом, вместо падения с двойным стектрейсом в логах.
+const STALE_INTERACTION_CODES = new Set([10062, 40060, 10008]); // Unknown interaction / already acknowledged / unknown message
+
+function patchInteractionAckMethods(interaction) {
+  const methods = ['reply', 'update', 'deferReply', 'deferUpdate', 'followUp', 'editReply', 'showModal'];
+  for (const name of methods) {
+    if (typeof interaction[name] !== 'function') continue;
+    const original = interaction[name].bind(interaction);
+    interaction[name] = async (...args) => {
+      try {
+        return await original(...args);
+      } catch (err) {
+        if (err && STALE_INTERACTION_CODES.has(err.code)) {
+          console.warn(`⚠️ Взаимодействие устарело (код ${err.code}, ${name}) — пропускаю, ответ пользователю не дойдёт.`);
+          return null;
+        }
+        throw err;
+      }
+    };
+  }
+}
+
 client.on('interactionCreate', async (interaction) => {
+  patchInteractionAckMethods(interaction);
   try {
     if (interaction.isChatInputCommand() && interaction.commandName === 'wine') {
       await handleWineCommand(interaction);
@@ -1653,6 +1680,7 @@ client.on('interactionCreate', async (interaction) => {
     await notifyError(interaction, `Произошла ошибка: ${err.message || err}`);
   }
 });
+
 
 async function handleWineCommand(interaction) {
   const title = interaction.options.getString('название');
