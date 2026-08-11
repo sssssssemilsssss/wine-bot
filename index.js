@@ -476,7 +476,8 @@ function buildProgressBar(done, total, size = 10) {
 // чтобы был виден и сам линк, и никнейм/подпись рядом с ним. Многострочные сообщения
 // схлопываем в одну строку и обрезаем, чтобы один участник не разъезжал весь список.
 function formatReportLine(text, limit = 300) {
-  const clean = text.replace(/\s+/g, ' ').trim();
+  if (!text) return '_ссылка не сохранена_';
+  const clean = String(text).replace(/\s+/g, ' ').trim();
   return clean.length > limit ? `${clean.slice(0, limit - 1)}…` : clean;
 }
 
@@ -576,7 +577,115 @@ async function handleBranchAllSubmitted(thread, branch) {
   const pings = FINAL_PING_USER_IDS.map((id) => `<@${id}>`).join(' ');
   await thread
     .send({ content: `${pings} ✅ В ветке «${branch.name}» все залили отчёты.` })
-    .catch(() => {});
+    .catch((e) => console.error('Не удалось отправить пинг "все залили" в ветке отчётов:', e));
+
+  try {
+    // Итоговый список — без тегов, просто то, что каждый написал вместе со ссылкой
+    // (обычно "ссылка никнейм"), чтобы можно было одним куском скопировать себе.
+    const lines = branch.participants
+      .filter((p) => p.submitted)
+      .map((p) => formatReportLine(p.reportText || p.link, 200));
+    const listEmbed = new EmbedBuilder()
+      .setTitle(`📋 Итоговый список отчётов: ${branch.name}`)
+      .setDescription(lines.length ? lines.join('\n') : '_нет отчётов_')
+      .setColor(0x57f287);
+
+    const controlsRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(cid('branch', 'close', branch.id))
+        .setLabel('Закрыть ветку')
+        .setEmoji(EMOJI.close)
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(cid('branch', 'delete', branch.id))
+        .setLabel('Удалить ветку')
+        .setEmoji(EMOJI.removePerson)
+        .setStyle(ButtonStyle.Danger)
+    );
+
+    await thread.send({ embeds: [listEmbed], components: [controlsRow] });
+  } catch (e) {
+    console.error('Не удалось отправить итоговый список отчётов:', e);
+  }
+}
+
+// Кнопки «Закрыть ветку» / «Удалить ветку», которые появляются под итоговым списком
+// после того как все залили отчёты. Нажимать может только тот, кого бот тегает в
+// финальном пинге (FINAL_PING_USER_IDS) — остальным доступ закрыт.
+async function handleBranchButton(interaction) {
+  const [, action, branchId] = parseCid(interaction.customId);
+  const branch = branches.get(branchId);
+  if (!branch) {
+    await interaction.reply({ content: '⚠️ Ветка не найдена.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (!FINAL_PING_USER_IDS.includes(interaction.user.id)) {
+    await interaction.reply({ content: '⛔ Закрывать и удалять ветку могут только ответственные.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  function stopReminders() {
+    const existing = branchIntervals.get(branch.id);
+    if (existing) {
+      clearInterval(existing);
+      branchIntervals.delete(branch.id);
+    }
+  }
+
+  if (action === 'close') {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    try {
+      const thread = await interaction.guild.channels.fetch(branch.threadId);
+      stopReminders();
+      await thread.setLocked(true).catch(() => {});
+      await thread.setArchived(true);
+      await interaction.editReply({ content: '🔒 Ветка закрыта.' });
+    } catch (e) {
+      console.error('Ошибка закрытия ветки отчётов:', e);
+      await interaction.editReply({ content: `⚠️ Не удалось закрыть ветку: ${e.message || e}` });
+    }
+    return;
+  }
+
+  if (action === 'delete') {
+    const confirmRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(cid('branch', 'confirmdelete', branchId))
+        .setLabel('Да, удалить')
+        .setEmoji(EMOJI.confirmYes)
+        .setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId(cid('branch', 'canceldelete', branchId))
+        .setLabel('Отмена')
+        .setEmoji(EMOJI.confirmNo)
+        .setStyle(ButtonStyle.Secondary)
+    );
+    await interaction.reply({
+      content: '⚠️ Точно удалить ветку целиком вместе со всеми отчётами? Это необратимо.',
+      components: [confirmRow],
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (action === 'canceldelete') {
+    await interaction.update({ content: 'Отменено.', components: [] });
+    return;
+  }
+
+  if (action === 'confirmdelete') {
+    await interaction.update({ content: '🗑️ Удаляю ветку…', components: [] });
+    try {
+      const thread = await interaction.guild.channels.fetch(branch.threadId).catch(() => null);
+      stopReminders();
+      branches.delete(branch.id);
+      saveBranches(branches);
+      if (thread) await thread.delete().catch(() => {});
+    } catch (e) {
+      console.error('Ошибка удаления ветки отчётов:', e);
+    }
+    return;
+  }
 }
 
 // Создание ветки: "!ветка <название>" ответом на сообщение со списком (тегами).
@@ -650,9 +759,20 @@ async function tryCreateBranch(message) {
     allSubmittedAnnounced: false,
   };
 
-  const statusMsg = await thread.send({ embeds: [buildBranchEmbed(branch)] });
-  branch.statusMessageId = statusMsg.id;
-  await statusMsg.pin().catch(() => {});
+  let statusMsg;
+  try {
+    statusMsg = await thread.send({ embeds: [buildBranchEmbed(branch)] });
+    branch.statusMessageId = statusMsg.id;
+    await statusMsg.pin().catch(() => {});
+  } catch (e) {
+    // Даже если эмбед по какой-то причине не отправился (например, у бота нет права
+    // «Встраивать ссылки» в этом канале) — ветку всё равно нужно сохранить и продолжить,
+    // иначе отчёты в ней просто не будут засчитываться.
+    console.error('Не удалось отправить стартовый эмбед ветки отчётов:', e);
+    await thread
+      .send({ content: '⚠️ Не удалось отправить эмбед со статусом (возможно, у бота нет права «Встраивать ссылки» в этом канале) — ветка всё равно работает.' })
+      .catch(() => {});
+  }
 
   branches.set(branch.id, branch);
   saveBranches(branches);
@@ -660,7 +780,7 @@ async function tryCreateBranch(message) {
 
   const tagChunks = chunkMentions(
     mentionedUsers.map((u) => u.id),
-    '🎥 Ветка отчётов создана. Как заливёте отчёт — киньте сюда ссылку (подойдёт с https://, www. или просто "домен.com/путь")\n'
+    '🎥 Ветка отчётов создана. Как зальёте откат — киньте сюда ссылку (подойдёт с https://, www. или просто "домен.com/путь")\n'
   );
   for (const chunk of tagChunks) {
     await thread.send({ content: chunk }).catch(() => {});
@@ -1681,6 +1801,8 @@ client.on('interactionCreate', async (interaction) => {
       const [prefix] = parseCid(interaction.customId);
       if (prefix === 'voice') {
         await handleVoiceButton(interaction);
+      } else if (prefix === 'branch') {
+        await handleBranchButton(interaction);
       } else {
         await handleButton(interaction);
       }
