@@ -597,6 +597,20 @@ function buildBranchControlsRow(branch) {
   );
 }
 
+// Ветку удалили вручную прямо в Discord (не кнопкой бота) — забываем про неё насовсем:
+// останавливаем напоминания, убираем из branches.json и обновляем дашборд, иначе она
+// так и будет висеть в "активных" вечно, хотя треда уже физически нет.
+async function removeDeadBranch(guild, branch) {
+  const existing = branchIntervals.get(branch.id);
+  if (existing) {
+    clearInterval(existing);
+    branchIntervals.delete(branch.id);
+  }
+  branches.delete(branch.id);
+  saveBranches(branches);
+  if (guild) await updateBranchDashboard(guild).catch(() => {});
+}
+
 async function updateBranchStatusMessage(guild, branch) {
   if (!branch.statusMessageId) return;
   try {
@@ -604,6 +618,11 @@ async function updateBranchStatusMessage(guild, branch) {
     const msg = await thread.messages.fetch(branch.statusMessageId);
     await msg.edit({ embeds: [buildBranchEmbed(branch)], components: [buildBranchControlsRow(branch)] });
   } catch (e) {
+    // 10003 Unknown Channel / 10008 Unknown Message — тред удалили вручную в Discord.
+    if (e.code === 10003 || e.code === 10008) {
+      await removeDeadBranch(guild, branch);
+      return;
+    }
     console.error('Не удалось обновить эмбед ветки отчётов:', e);
   }
 }
@@ -691,9 +710,8 @@ async function sendBranchReminder(client, branch) {
     if (!guild) return;
     const thread = await guild.channels.fetch(branch.threadId).catch(() => null);
     if (!thread) {
-      // ветку удалили вручную — останавливаем таймер
-      clearInterval(branchIntervals.get(branch.id));
-      branchIntervals.delete(branch.id);
+      // ветку удалили вручную — забываем про неё насовсем
+      await removeDeadBranch(guild, branch);
       return;
     }
 
@@ -2099,6 +2117,11 @@ client.on('threadDelete', async (thread) => {
         await updateListMessage(thread.guild, list).catch(() => {});
         break;
       }
+    }
+
+    const branch = branches.get(thread.id);
+    if (branch) {
+      await removeDeadBranch(thread.guild, branch);
     }
   } catch (e) {
     console.error('Ошибка обработки threadDelete:', e);
