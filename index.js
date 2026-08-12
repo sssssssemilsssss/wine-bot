@@ -1,5 +1,6 @@
 require('dotenv').config();
 const crypto = require('crypto');
+const fs = require('fs');
 const path = require('path');
 const {
   Client,
@@ -133,6 +134,28 @@ const voiceData = loadVoiceData(); // { configs: { guildId: {triggerChannelId, c
 const branches = loadBranches(); // Map<threadId, branch> — ветки отчётов, см. handleBranchMessage()
 const branchIntervals = new Map(); // threadId -> intervalHandle (в память, не сохраняется на диск)
 
+// Небольшой файл, хранящий ID закреплённого сообщения-дашборда веток отчётов
+// (см. updateBranchDashboard). Та же логика "пишем в /app/data, если она есть", что и
+// у остальных хранилищ — см. branchesStorage.js.
+const DASHBOARD_DATA_DIR = fs.existsSync('/app/data') ? '/app/data' : __dirname;
+const DASHBOARD_FILE = path.join(DASHBOARD_DATA_DIR, 'branch-dashboard.json');
+function loadDashboardState() {
+  try {
+    if (!fs.existsSync(DASHBOARD_FILE)) return { messageId: null };
+    return JSON.parse(fs.readFileSync(DASHBOARD_FILE, 'utf8'));
+  } catch (e) {
+    console.error('Не удалось прочитать branch-dashboard.json:', e);
+    return { messageId: null };
+  }
+}
+function saveDashboardState(state) {
+  fs.mkdirSync(DASHBOARD_DATA_DIR, { recursive: true });
+  const tmp = `${DASHBOARD_FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
+  fs.renameSync(tmp, DASHBOARD_FILE);
+}
+const dashboardState = loadDashboardState();
+
 // Диагностика для деплоев: если после рестарта/деплоя наборы (/wine) или ветки отчётов
 // "пропадают" — почти всегда это не баг в коде, а то, что деплой поднимает бота в новом
 // контейнере/директории без сохранённых branches.json / lists.json / voicedata.json
@@ -143,7 +166,7 @@ console.log(
   `[startup] загружено: наборов (/wine) — ${lists.size}, веток отчётов — ${branches.size}, ` +
     `голосовых комнат — ${Object.keys(voiceData.rooms || {}).length}`
 );
-console.log(`[startup] branches.json: ${path.join(__dirname, 'branches.json')}`);
+console.log(`[startup] данные хранятся в: ${DASHBOARD_DATA_DIR}`);
 
 process.on('SIGTERM', () => {
   console.log('[shutdown] получен SIGTERM, завершаюсь штатно.');
@@ -585,6 +608,83 @@ async function updateBranchStatusMessage(guild, branch) {
   }
 }
 
+// ---------- Общий дашборд веток отчётов (в BRANCH_TARGET_CHANNEL_ID) ----------
+// Одно закреплённое сообщение-эмбед, которое всегда отражает текущее состояние всех
+// веток: сколько активных, сколько залито/не залито в каждой, и последние закрытые.
+
+function buildBranchLine(branch) {
+  const total = branch.participants.length;
+  const submitted = branch.participants.filter((p) => p.submitted).length;
+  const missing = branch.participants.filter((p) => !p.submitted).map((p) => `<@${p.id}>`);
+  const bar = buildProgressBar(submitted, total, 6);
+  const status = total > 0 && submitted === total ? '✅' : '🟡';
+  let line = `${status} <#${branch.threadId}> **${branch.name}** — ${bar} ${submitted}/${total}`;
+  if (missing.length) {
+    const shown = missing.slice(0, 6).join(', ');
+    line += `\n> ⏳ ждём: ${shown}${missing.length > 6 ? ` и ещё ${missing.length - 6}` : ''}`;
+  }
+  return line;
+}
+
+function buildClosedLine(branch) {
+  const total = branch.participants.length;
+  const submitted = branch.participants.filter((p) => p.submitted).length;
+  return `🔒 **${branch.name}** — ${submitted}/${total}${branch.closedAt ? ` · закрыта <t:${branch.closedAt}:R>` : ''}`;
+}
+
+function buildBranchDashboardEmbed() {
+  const all = [...branches.values()];
+  const active = all.filter((b) => !b.closed).sort((a, b) => a.createdAt - b.createdAt);
+  const closed = all
+    .filter((b) => b.closed)
+    .sort((a, b) => (b.closedAt || 0) - (a.closedAt || 0))
+    .slice(0, 10);
+
+  const embed = new EmbedBuilder()
+    .setTitle('📊 Ветки отчётов')
+    .setColor(active.some((b) => b.participants.some((p) => !p.submitted)) ? 0xf1c40f : 0x57f287)
+    .setDescription(`🟢 Активных: **${active.length}**   ·   🔒 Закрыто (всего): **${all.filter((b) => b.closed).length}**`)
+    .setTimestamp();
+
+  const activeLines = active.length ? active.map(buildBranchLine) : ['_нет активных веток_'];
+  chunkTextLines(activeLines, 950).forEach((val, i) =>
+    embed.addFields({ name: i === 0 ? `🟢 Активные (${active.length})` : '\u200b', value: val })
+  );
+
+  const closedLines = closed.length ? closed.map(buildClosedLine) : ['_пока ничего не закрывали_'];
+  chunkTextLines(closedLines, 950).forEach((val, i) =>
+    embed.addFields({ name: i === 0 ? '🔒 Последние закрытые' : '\u200b', value: val })
+  );
+
+  return embed;
+}
+
+async function updateBranchDashboard(guild) {
+  try {
+    const channel = await guild.channels.fetch(BRANCH_TARGET_CHANNEL_ID);
+    if (!channel) return;
+    const embed = buildBranchDashboardEmbed();
+
+    if (dashboardState.messageId) {
+      try {
+        const msg = await channel.messages.fetch(dashboardState.messageId);
+        await msg.edit({ embeds: [embed] });
+        return;
+      } catch (e) {
+        // сообщение удалили вручную — создадим новое ниже
+        dashboardState.messageId = null;
+      }
+    }
+
+    const msg = await channel.send({ embeds: [embed] });
+    await msg.pin().catch(() => {});
+    dashboardState.messageId = msg.id;
+    saveDashboardState(dashboardState);
+  } catch (e) {
+    console.error('Не удалось обновить дашборд веток отчётов:', e);
+  }
+}
+
 async function sendBranchReminder(client, branch) {
   try {
     const guild = await client.guilds.fetch(branch.guildId).catch(() => null);
@@ -623,6 +723,7 @@ async function handleBranchAllSubmitted(thread, branch) {
   if (branch.allSubmittedAnnounced) return;
   branch.allSubmittedAnnounced = true;
   saveBranches(branches);
+  await updateBranchDashboard(thread.guild).catch(() => {});
   const pings = FINAL_PING_USER_IDS.map((id) => `<@${id}>`).join(' ');
   await thread
     .send({ content: `${pings} ✅ В ветке «${branch.name}» все залили отчёты.` })
@@ -645,6 +746,13 @@ async function handleBranchAllSubmitted(thread, branch) {
   }
 }
 
+// Трое ответственных (FINAL_PING_USER_IDS) и все, у кого высшая роль (BRANCH_TOP_ROLE_ID) —
+// у них есть доступ к любой кнопке ветки, независимо от того, они ли её создали.
+function isBranchManager(interaction) {
+  if (FINAL_PING_USER_IDS.includes(interaction.user.id)) return true;
+  return Boolean(interaction.member?.roles?.cache?.has(BRANCH_TOP_ROLE_ID));
+}
+
 // Кнопки «Закрыть ветку» / «Удалить ветку», которые появляются под итоговым списком
 // после того как все залили отчёты. Нажимать может только тот, кого бот тегает в
 // финальном пинге (FINAL_PING_USER_IDS) — остальным доступ закрыт.
@@ -656,11 +764,11 @@ async function handleBranchButton(interaction) {
     return;
   }
 
-  // Состав ветки (добавить/убрать участника) правит только тот, кто её создал —
-  // так же, как и через текстовые команды "+ @юзер" / "- @юзер".
+  // Состав ветки (добавить/убрать участника) правит тот, кто её создал, либо трое
+  // ответственных, либо те, у кого высшая роль — как и через "+ @юзер" / "- @юзер".
   if (action === 'addparticipant' || action === 'removeparticipant') {
-    if (interaction.user.id !== branch.creatorId) {
-      await interaction.reply({ content: '⛔ Менять состав ветки может только тот, кто её создал.', flags: MessageFlags.Ephemeral });
+    if (interaction.user.id !== branch.creatorId && !isBranchManager(interaction)) {
+      await interaction.reply({ content: '⛔ Менять состав ветки может только создатель или ответственные.', flags: MessageFlags.Ephemeral });
       return;
     }
     const select = new UserSelectMenuBuilder()
@@ -672,9 +780,9 @@ async function handleBranchButton(interaction) {
     return;
   }
 
-  // Закрыть/удалить ветку — только те, кого бот тегает в финальном пинге.
-  if (!FINAL_PING_USER_IDS.includes(interaction.user.id)) {
-    await interaction.reply({ content: '⛔ Закрывать и удалять ветку могут только ответственные.', flags: MessageFlags.Ephemeral });
+  // Закрыть/удалить ветку/скрыть-показать доступ — только ответственные или высшая роль.
+  if (!isBranchManager(interaction)) {
+    await interaction.reply({ content: '⛔ Эта кнопка доступна только ответственным.', flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -693,11 +801,7 @@ async function handleBranchButton(interaction) {
       if (!branch.hidden) {
         // Скрыть: убираем из участников ветки всех, кроме тех, у кого топ-роль, и трёх
         // ответственных — им доступ виден и написать сообщение, у остальных пропадает.
-        const keepIds = new Set(FINAL_PING_USER_IDS);
-        const roleMembers = await interaction.guild.members.fetch();
-        for (const [, member] of roleMembers) {
-          if (member.roles.cache.has(BRANCH_TOP_ROLE_ID)) keepIds.add(member.id);
-        }
+        const keepIds = await getBranchManagerIds(interaction.guild);
         await Promise.all([...keepIds].map((id) => thread.members.add(id).catch(() => {})));
         const currentMembers = await thread.members.fetch();
         await Promise.all(
@@ -707,8 +811,10 @@ async function handleBranchButton(interaction) {
         );
         branch.hidden = true;
       } else {
-        // Показать: возвращаем доступ участникам ветки и создателю.
-        const restoreIds = new Set([branch.creatorId, ...branch.participants.map((p) => p.id)]);
+        // Показать: возвращаем доступ участникам ветки, создателю и ответственным.
+        const restoreIds = await getBranchManagerIds(interaction.guild);
+        restoreIds.add(branch.creatorId);
+        for (const p of branch.participants) restoreIds.add(p.id);
         await Promise.all([...restoreIds].map((id) => thread.members.add(id).catch(() => {})));
         branch.hidden = false;
       }
@@ -729,6 +835,10 @@ async function handleBranchButton(interaction) {
       stopReminders();
       await thread.setLocked(true).catch(() => {});
       await thread.setArchived(true);
+      branch.closed = true;
+      branch.closedAt = Math.floor(Date.now() / 1000);
+      saveBranches(branches);
+      await updateBranchDashboard(interaction.guild).catch(() => {});
       await interaction.editReply({ content: '🔒 Ветка закрыта.' });
     } catch (e) {
       console.error('Ошибка закрытия ветки отчётов:', e);
@@ -770,6 +880,7 @@ async function handleBranchButton(interaction) {
       stopReminders();
       branches.delete(branch.id);
       saveBranches(branches);
+      await updateBranchDashboard(interaction.guild).catch(() => {});
       if (thread) await thread.delete().catch(() => {});
     } catch (e) {
       console.error('Ошибка удаления ветки отчётов:', e);
@@ -786,8 +897,8 @@ async function handleBranchUserSelect(interaction) {
     await interaction.update({ content: '⚠️ Ветка не найдена.', components: [] });
     return;
   }
-  if (interaction.user.id !== branch.creatorId) {
-    await interaction.update({ content: '⛔ Менять состав ветки может только тот, кто её создал.', components: [] });
+  if (interaction.user.id !== branch.creatorId && !isBranchManager(interaction)) {
+    await interaction.update({ content: '⛔ Менять состав ветки может только создатель или ответственные.', components: [] });
     return;
   }
 
@@ -804,6 +915,7 @@ async function handleBranchUserSelect(interaction) {
     }
     branch.allSubmittedAnnounced = false;
     saveBranches(branches);
+    await updateBranchDashboard(guild).catch(() => {});
     const thread = await guild.channels.fetch(branch.threadId).catch(() => null);
     if (thread) await Promise.all(targetIds.map((id) => thread.members.add(id).catch(() => {})));
     await updateBranchStatusMessage(guild, branch);
@@ -821,6 +933,7 @@ async function handleBranchUserSelect(interaction) {
     const removed = before !== branch.participants.length;
     saveBranches(branches);
     await updateBranchStatusMessage(guild, branch);
+    await updateBranchDashboard(guild).catch(() => {});
     await interaction.update({
       content: removed ? `➖ Убраны: ${targetIds.map((id) => `<@${id}>`).join(', ')}` : 'ℹ️ Ничего не изменилось.',
       components: [],
@@ -834,6 +947,20 @@ async function handleBranchUserSelect(interaction) {
 }
 
 // Создание ветки: "!ветка <название>" ответом на сообщение со списком (тегами).
+// ID всех, кому доступ к ветке нужен всегда: трое ответственных + все с высшей ролью.
+async function getBranchManagerIds(guild) {
+  const ids = new Set(FINAL_PING_USER_IDS);
+  try {
+    const members = await guild.members.fetch();
+    for (const [, member] of members) {
+      if (member.roles.cache.has(BRANCH_TOP_ROLE_ID)) ids.add(member.id);
+    }
+  } catch (e) {
+    console.error('Не удалось получить участников с высшей ролью:', e);
+  }
+  return ids;
+}
+
 async function tryCreateBranch(message) {
   const raw = message.content.trim();
   const lower = raw.toLowerCase();
@@ -892,6 +1019,12 @@ async function tryCreateBranch(message) {
     });
     await Promise.all(mentionedUsers.map((u) => thread.members.add(u.id).catch(() => {})));
     await thread.members.add(message.author.id).catch(() => {});
+    const managerIds = await getBranchManagerIds(message.guild);
+    await Promise.all(
+      [...managerIds].map((id) =>
+        thread.members.add(id).catch((err) => console.error(`Не удалось добавить ${id} (ответственный/топ-роль) в ветку:`, err?.message || err))
+      )
+    );
   } catch (e) {
     console.error('Ошибка создания ветки отчётов:', e);
     await message.reply({
@@ -934,6 +1067,7 @@ async function tryCreateBranch(message) {
   branches.set(branch.id, branch);
   saveBranches(branches);
   scheduleBranchReminders(message.client, branch);
+  await updateBranchDashboard(message.guild).catch(() => {});
 
   const tagChunks = chunkMentions(
     mentionedUsers.map((u) => u.id),
@@ -996,6 +1130,7 @@ async function tryManageBranchParticipants(message, branch) {
 
   saveBranches(branches);
   await updateBranchStatusMessage(message.guild, branch);
+  await updateBranchDashboard(message.guild).catch(() => {});
 
   const confirm = await message.reply({
     content:
@@ -1068,6 +1203,7 @@ async function tryRegisterBranchReport(message, branch) {
     participant.reportText = message.content.trim();
     participant.submittedAt = Math.floor(Date.now() / 1000);
     saveBranches(branches);
+    await updateBranchDashboard(message.guild).catch(() => {});
 
     if (videoAttached) {
       // Ссылка принята, но видео вложением всё равно удаляем — только ссылки.
@@ -1801,11 +1937,28 @@ client.once('clientReady', async () => {
   }
   saveVoiceData(voiceData);
 
-  // Восстанавливаем почасовые напоминания по веткам отчётов после перезапуска бота.
+  // Восстанавливаем почасовые напоминания по веткам отчётов после перезапуска бота
+  // (закрытым веткам напоминания не нужны).
+  let restoredCount = 0;
   for (const branch of branches.values()) {
-    scheduleBranchReminders(client, branch);
+    if (!branch.closed) {
+      scheduleBranchReminders(client, branch);
+      restoredCount += 1;
+    }
   }
-  console.log(`Восстановлено веток отчётов: ${branches.size}`);
+  console.log(`Восстановлено веток отчётов: ${branches.size} (активных с напоминаниями: ${restoredCount})`);
+
+  try {
+    const guild = await client.guilds.fetch(GUILD_ID);
+    await Promise.all(
+      [...branches.values()]
+        .filter((b) => !b.closed)
+        .map((b) => updateBranchStatusMessage(guild, b).catch(() => {}))
+    );
+    await updateBranchDashboard(guild);
+  } catch (e) {
+    console.error('Не удалось обновить дашборд веток отчётов при запуске:', e);
+  }
 });
 
 client.on('voiceStateUpdate', async (oldState, newState) => {
